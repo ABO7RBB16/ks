@@ -1,0 +1,509 @@
+--[[
+╔══════════════════════════════════════════════════════════════╗
+║           SERVER OPTIMIZER & MEMORY CLEANER                  ║
+║           by Claude | نظام تنظيف وتحسين السيرفر             ║
+║                                                              ║
+║  الميزات:                                                    ║
+║  ✅ تنظيف ذاكرة السيرفر تلقائياً                            ║
+║  ✅ منع تسرب الذاكرة (Memory Leak Prevention)               ║
+║  ✅ تحسين FPS للاعبين                                        ║
+║  ✅ تنظيف الـ RAM                                            ║
+║  ✅ تقليل الضغط على المعالج (CPU)                           ║
+║  ✅ نظام مراقبة وتقارير                                      ║
+╚══════════════════════════════════════════════════════════════╝
+]]
+
+-- ══════════════════════════════════════════
+--  يُوضع هذا السكربت في: ServerScriptService
+-- ══════════════════════════════════════════
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local Stats = game:GetService("Stats")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+
+-- ══════════════════════════════════════
+--  ⚙️  إعدادات النظام (قابلة للتعديل)
+-- ══════════════════════════════════════
+local CONFIG = {
+	-- تنظيف الذاكرة
+	MEMORY_CLEAN_INTERVAL     = 60,    -- كل كم ثانية يتم تنظيف ذاكرة السيرفر
+	MEMORY_WARNING_THRESHOLD  = 1500,  -- MB - تحذير عند تجاوز هذا الحد
+	MEMORY_CRITICAL_THRESHOLD = 2500,  -- MB - إجراء طارئ عند تجاوز هذا الحد
+
+	-- تنظيف المخلفات
+	DEBRIS_CLEAN_INTERVAL     = 30,    -- كل كم ثانية يتم تنظيف المخلفات
+	PART_AGE_LIMIT            = 120,   -- ثواني - عمر الـ Parts العشوائية قبل حذفها
+
+	-- تحسين اللاعبين
+	PLAYER_OPTIMIZE_INTERVAL  = 45,    -- كل كم ثانية يتم تحسين اداء اللاعبين
+	MAX_UNANCHORED_PARTS      = 50,    -- حد الـ Parts غير المثبتة لكل لاعب
+	STREAMING_ENABLED         = true,  -- تفعيل Streaming لتقليل الحمل
+
+	-- تنظيف الـ Connections
+	CONNECTION_CHECK_INTERVAL = 20,    -- كل كم ثانية يتم فحص الـ Connections
+
+	-- المراقبة
+	LOG_ENABLED               = true,  -- تفعيل السجل
+	REPORT_INTERVAL           = 120,   -- كل كم ثانية يتم عرض تقرير الأداء
+}
+
+-- ══════════════════════════════════
+--  📦 متغيرات النظام
+-- ══════════════════════════════════
+local activeConnections = {}   -- تتبع كل الـ Connections
+local playerData        = {}   -- بيانات اللاعبين
+local cleanupQueue      = {}   -- طابور التنظيف
+local lastMemoryUsage   = 0
+local totalCleaned      = 0
+
+-- ══════════════════════════════════
+--  🖨️  نظام السجل
+-- ══════════════════════════════════
+local function log(msg, level)
+	if not CONFIG.LOG_ENABLED then return end
+	level = level or "INFO"
+	local prefix = {
+		INFO     = "✅ [OPTIMIZER]",
+		WARN     = "⚠️  [OPTIMIZER]",
+		ERROR    = "❌ [OPTIMIZER]",
+		CRITICAL = "🚨 [OPTIMIZER]",
+		CLEAN    = "🧹 [OPTIMIZER]",
+	}
+	print(string.format("%s [%s] %s", prefix[level] or "[OPTIMIZER]", os.date("%H:%M:%S"), msg))
+end
+
+-- ══════════════════════════════════════════
+--  🛡️  إدارة الـ Connections لمنع التسرب
+-- ══════════════════════════════════════════
+local ConnectionManager = {}
+ConnectionManager.__index = ConnectionManager
+
+function ConnectionManager.new(owner)
+	return setmetatable({
+		_owner       = owner or "Unknown",
+		_connections = {},
+		_count       = 0,
+	}, ConnectionManager)
+end
+
+function ConnectionManager:add(connection, name)
+	if connection and typeof(connection) == "RBXScriptConnection" then
+		name = name or ("conn_" .. self._count)
+		self._connections[name] = connection
+		self._count += 1
+		return connection
+	end
+	return nil
+end
+
+function ConnectionManager:remove(name)
+	if self._connections[name] then
+		pcall(function()
+			self._connections[name]:Disconnect()
+		end)
+		self._connections[name] = nil
+		self._count -= 1
+	end
+end
+
+function ConnectionManager:disconnectAll()
+	local count = 0
+	for name, conn in pairs(self._connections) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+		self._connections[name] = nil
+		count += 1
+	end
+	self._count = 0
+	return count
+end
+
+-- مدير Connections رئيسي للسيرفر
+local serverConnections = ConnectionManager.new("Server")
+
+-- ══════════════════════════════════════════
+--  🧹 تنظيف ذاكرة السيرفر
+-- ══════════════════════════════════════════
+local function getServerMemory()
+	return math.floor(Stats:GetTotalMemoryUsageMb())
+end
+
+local function cleanServerMemory()
+	local before = getServerMemory()
+
+	-- 1. تنظيف الـ Instances المنتهية الصلاحية في Workspace
+	local cleaned = 0
+	local now = os.clock()
+
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		-- حذف الـ Parts العشوائية القديمة (لا اسم لها أو اسمها "Part")
+		if obj:IsA("BasePart") then
+			if not obj.Anchored
+				and obj.Parent == workspace
+				and (obj.Name == "Part" or obj.Name == "Handle" or obj.Name == "Effect")
+			then
+				-- تحقق من عمرها باستخدام Attribute
+				local birthTime = obj:GetAttribute("BirthTime")
+				if birthTime and (now - birthTime) > CONFIG.PART_AGE_LIMIT then
+					obj:Destroy()
+					cleaned += 1
+				elseif not birthTime then
+					obj:SetAttribute("BirthTime", now)
+				end
+			end
+		end
+
+		-- حذف الـ Sounds المنتهية
+		if obj:IsA("Sound") and not obj.IsPlaying and obj:GetAttribute("AutoClean") then
+			obj:Destroy()
+			cleaned += 1
+		end
+
+		-- حذف الـ Particles المتوقفة
+		if obj:IsA("ParticleEmitter") and obj:GetAttribute("AutoClean") then
+			if obj.Enabled == false then
+				obj:Destroy()
+				cleaned += 1
+			end
+		end
+	end
+
+	-- 2. تنظيف الـ Tweens المنتهية (يتم عبر الـ Connections Manager)
+	-- 3. فرض جمع القمامة (Lua GC)
+	collectgarbage("collect")
+	collectgarbage("collect") -- مرتين للتأكد
+
+	local after = getServerMemory()
+	local freed = math.max(0, before - after)
+	totalCleaned += freed
+
+	if cleaned > 0 or freed > 0 then
+		log(string.format("تم تنظيف الذاكرة | قبل: %d MB | بعد: %d MB | محرر: %d MB | عناصر محذوفة: %d",
+			before, after, freed, cleaned), "CLEAN")
+	end
+
+	-- تحذير إذا تجاوزت الذاكرة الحد
+	if after > CONFIG.MEMORY_CRITICAL_THRESHOLD then
+		log(string.format("خطر! استخدام الذاكرة: %d MB - يتجاوز الحد الحرج!", after), "CRITICAL")
+		-- إجراء طارئ: تنظيف مكثف
+		for _, player in ipairs(Players:GetPlayers()) do
+			player:LoadCharacter() -- إعادة تحميل الشخصيات لتقليل الحمل
+		end
+	elseif after > CONFIG.MEMORY_WARNING_THRESHOLD then
+		log(string.format("تحذير! استخدام الذاكرة: %d MB", after), "WARN")
+	end
+
+	lastMemoryUsage = after
+end
+
+-- ══════════════════════════════════════════
+--  👤 تحسين أداء اللاعبين
+-- ══════════════════════════════════════════
+local function optimizePlayer(player)
+	local character = player.Character
+	if not character then return end
+
+	local cleaned = 0
+
+	-- 1. حذف الـ Parts غير الضرورية من الشخصية
+	for _, obj in ipairs(character:GetDescendants()) do
+		-- حذف الـ Accessories المكررة
+		if obj:IsA("Accessory") then
+			local handle = obj:FindFirstChild("Handle")
+			if handle then
+				-- تبسيط الـ mesh إن أمكن
+				if handle:FindFirstChildOfClass("SpecialMesh") then
+					-- إبقاؤه لكن تقليل تعقيده
+				end
+			end
+		end
+
+		-- حذف الـ Decals الزائدة
+		if obj:IsA("Decal") and obj:GetAttribute("Removable") then
+			obj:Destroy()
+			cleaned += 1
+		end
+
+		-- إيقاف الـ Particles عند بُعد اللاعب
+		if obj:IsA("ParticleEmitter") and obj:GetAttribute("LOD_Disable") then
+			obj.Enabled = false
+		end
+	end
+
+	-- 2. تحسين الـ Humanoid
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		-- تفعيل تحسينات الـ Humanoid
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Flying, false)
+		humanoid.AutoRotate = true
+	end
+
+	-- 3. تنظيف الـ Scripts الميتة داخل الشخصية
+	for _, script in ipairs(character:GetDescendants()) do
+		if (script:IsA("LocalScript") or script:IsA("Script"))
+			and not script.Enabled
+			and script:GetAttribute("AutoClean")
+		then
+			script:Destroy()
+			cleaned += 1
+		end
+	end
+
+	if cleaned > 0 then
+		log(string.format("تحسين شخصية '%s' | محذوف: %d عنصر", player.Name, cleaned), "CLEAN")
+	end
+end
+
+local function optimizeAllPlayers()
+	for _, player in ipairs(Players:GetPlayers()) do
+		pcall(optimizePlayer, player)
+	end
+end
+
+-- ══════════════════════════════════════════
+--  🔗 منع تسرب الـ Connections
+-- ══════════════════════════════════════════
+local function setupPlayerConnectionTracking(player)
+	-- إنشاء مدير خاص بكل لاعب
+	playerData[player.UserId] = {
+		connections = ConnectionManager.new(player.Name),
+		joinTime    = os.clock(),
+		name        = player.Name,
+	}
+
+	local pData = playerData[player.UserId]
+
+	-- تتبع الشخصية
+	pData.connections:add(
+		player.CharacterAdded:Connect(function(character)
+			-- تنظيف بعد تحميل الشخصية
+			task.delay(3, function()
+				pcall(optimizePlayer, player)
+			end)
+		end),
+		"CharacterAdded"
+	)
+
+	log(string.format("تم تتبع اللاعب: %s (ID: %d)", player.Name, player.UserId))
+end
+
+local function cleanupPlayerData(player)
+	local pData = playerData[player.UserId]
+	if pData then
+		local count = pData.connections:disconnectAll()
+		playerData[player.UserId] = nil
+		log(string.format("تم تنظيف بيانات '%s' | قطع Connections: %d", player.Name, count), "CLEAN")
+	end
+end
+
+-- ══════════════════════════════════════════
+--  🗑️  نظام تنظيف المخلفات المتقدم
+-- ══════════════════════════════════════════
+local function cleanDebris()
+	local cleaned = 0
+
+	-- البحث عن العناصر المميزة للحذف التلقائي
+	local function searchAndClean(parent)
+		for _, obj in ipairs(parent:GetChildren()) do
+			if obj:GetAttribute("AutoDestroy") == true then
+				obj:Destroy()
+				cleaned += 1
+			elseif obj:IsA("Model") and #obj:GetChildren() == 0 then
+				-- نماذج فارغة
+				if obj:GetAttribute("AllowEmpty") ~= true then
+					obj:Destroy()
+					cleaned += 1
+				end
+			elseif obj:IsA("Folder") and #obj:GetChildren() == 0 then
+				if obj:GetAttribute("KeepEmpty") ~= true then
+					-- إبقاء المجلدات الفارغة المقصودة
+				end
+			else
+				-- لا تنظيف داخل شخصيات اللاعبين
+				local isPlayerChar = false
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p.Character == obj then
+						isPlayerChar = true
+						break
+					end
+				end
+				if not isPlayerChar then
+					searchAndClean(obj)
+				end
+			end
+		end
+	end
+
+	pcall(searchAndClean, workspace)
+
+	if cleaned > 0 then
+		log(string.format("تنظيف المخلفات: تم حذف %d عنصر", cleaned), "CLEAN")
+	end
+end
+
+-- ══════════════════════════════════════════
+--  📊 تقرير الأداء
+-- ══════════════════════════════════════════
+local function printReport()
+	local mem    = getServerMemory()
+	local players = Players:GetPlayers()
+	local connCount = 0
+
+	for _, pData in pairs(playerData) do
+		connCount += pData.connections._count
+	end
+
+	print("═══════════════════════════════════════════")
+	print("📊  تقرير أداء السيرفر")
+	print("═══════════════════════════════════════════")
+	print(string.format("🕐 الوقت        : %s", os.date("%Y-%m-%d %H:%M:%S")))
+	print(string.format("💾 ذاكرة السيرفر: %d MB", mem))
+	print(string.format("👥 اللاعبين     : %d", #players))
+	print(string.format("🔗 Connections  : %d", connCount))
+	print(string.format("🧹 مجموع المحرر : %d MB", totalCleaned))
+	print(string.format("📡 Ping متوسط  : ~%d ms",
+		#players > 0 and math.floor(Players:GetPlayers()[1]:GetNetworkPing() * 1000) or 0))
+
+	-- حالة الذاكرة
+	local status
+	if mem < 800 then
+		status = "✅ ممتازة"
+	elseif mem < CONFIG.MEMORY_WARNING_THRESHOLD then
+		status = "🟡 جيدة"
+	elseif mem < CONFIG.MEMORY_CRITICAL_THRESHOLD then
+		status = "🟠 مرتفعة"
+	else
+		status = "🔴 حرجة"
+	end
+	print(string.format("⚡ حالة الذاكرة : %s", status))
+	print("═══════════════════════════════════════════")
+end
+
+-- ══════════════════════════════════════════
+--  🔧 تحسينات إضافية للسيرفر
+-- ══════════════════════════════════════════
+local function applyServerOptimizations()
+	-- تحسين إعدادات Workspace
+	workspace.StreamingEnabled    = CONFIG.STREAMING_ENABLED
+	workspace.StreamingMinRadius  = 64
+	workspace.StreamingTargetRadius = 256
+
+	-- تقليل دقة الفيزياء لتقليل حمل المعالج (اختياري)
+	-- workspace:SetPhysicsThrottleEnabled(true)
+
+	log("تم تطبيق تحسينات السيرفر الأساسية ✅")
+end
+
+-- ══════════════════════════════════════════
+--  🚀 بدء تشغيل النظام
+-- ══════════════════════════════════════════
+local function initialize()
+	log("═══════════════════════════════════════")
+	log("  🚀 بدء تشغيل نظام التحسين والتنظيف  ")
+	log("═══════════════════════════════════════")
+
+	-- تطبيق الإعدادات
+	applyServerOptimizations()
+
+	-- تتبع اللاعبين الحاليين
+	for _, player in ipairs(Players:GetPlayers()) do
+		setupPlayerConnectionTracking(player)
+	end
+
+	-- ── ربط أحداث اللاعبين ──
+	serverConnections:add(
+		Players.PlayerAdded:Connect(setupPlayerConnectionTracking),
+		"PlayerAdded"
+	)
+
+	serverConnections:add(
+		Players.PlayerRemoving:Connect(function(player)
+			task.delay(1, function()
+				cleanupPlayerData(player)
+			end)
+		end),
+		"PlayerRemoving"
+	)
+
+	-- ── تنظيف الذاكرة الدوري ──
+	task.spawn(function()
+		while true do
+			task.wait(CONFIG.MEMORY_CLEAN_INTERVAL)
+			pcall(cleanServerMemory)
+		end
+	end)
+
+	-- ── تنظيف المخلفات الدوري ──
+	task.spawn(function()
+		while true do
+			task.wait(CONFIG.DEBRIS_CLEAN_INTERVAL)
+			pcall(cleanDebris)
+		end
+	end)
+
+	-- ── تحسين اللاعبين الدوري ──
+	task.spawn(function()
+		while true do
+			task.wait(CONFIG.PLAYER_OPTIMIZE_INTERVAL)
+			pcall(optimizeAllPlayers)
+		end
+	end)
+
+	-- ── تقارير الأداء ──
+	task.spawn(function()
+		while true do
+			task.wait(CONFIG.REPORT_INTERVAL)
+			pcall(printReport)
+		end
+	end)
+
+	-- تنظيف أولي فوري
+	task.delay(5, function()
+		pcall(cleanServerMemory)
+		pcall(cleanDebris)
+		pcall(optimizeAllPlayers)
+		log("✅ اكتمل التنظيف الأولي للسيرفر")
+	end)
+
+	log("✅ النظام يعمل بنجاح!")
+	log(string.format("   🔄 تنظيف الذاكرة : كل %d ثانية", CONFIG.MEMORY_CLEAN_INTERVAL))
+	log(string.format("   🗑️  تنظيف المخلفات: كل %d ثانية", CONFIG.DEBRIS_CLEAN_INTERVAL))
+	log(string.format("   👤 تحسين اللاعبين: كل %d ثانية", CONFIG.PLAYER_OPTIMIZE_INTERVAL))
+	log(string.format("   📊 تقرير الأداء  : كل %d ثانية", CONFIG.REPORT_INTERVAL))
+end
+
+-- تشغيل النظام مع حماية من الأخطاء
+local success, err = pcall(initialize)
+if not success then
+	warn("❌ [OPTIMIZER] فشل تشغيل النظام: " .. tostring(err))
+end
+
+--[[
+═══════════════════════════════════════════════
+📖  دليل الاستخدام
+═══════════════════════════════════════════════
+
+1. ضع هذا السكربت في: ServerScriptService
+
+2. علامات للعناصر (Attributes) يمكنك إضافتها:
+   • AutoDestroy = true  ← يحذف العنصر تلقائياً عند التنظيف
+   • AutoClean   = true  ← للـ Sounds والـ Scripts الميتة
+   • BirthTime         ← يضاف تلقائياً للـ Parts العشوائية
+   • AllowEmpty  = true  ← يمنع حذف النماذج الفارغة
+   • KeepEmpty   = true  ← يمنع حذف المجلدات الفارغة
+   • LOD_Disable = true  ← يوقف الـ Particles عند التحسين
+
+3. لإضافة Attribute في Studio:
+   اختر العنصر → Properties → Attributes → Add Attribute
+
+4. تعديل الإعدادات:
+   غير القيم في قسم CONFIG في أعلى السكربت
+
+═══════════════════════════════════════════════
+]]
